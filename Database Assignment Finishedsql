@@ -1,0 +1,1052 @@
+
+--Sequence for the run log table
+CREATE SEQUENCE FSS_RUNLOG_SEQ
+START WITH 1
+MAXVALUE 99999999999
+INCREMENT BY 1;
+
+DROP SEQUENCE FSS_RUNLOG_SEQ;
+
+--Sequence for the lodge reference id in daily settlement and daily transaction
+CREATE SEQUENCE FSS_LODGE_SEQ
+START WITH 1
+MAXVALUE 99999999999
+INCREMENT BY 1;
+
+DROP SEQUENCE FSS_LODGE_SEQ;
+
+--Creating Directory, to /exporst/orcloz
+DROP DIRECTORY U13022658_DIR;
+CREATE DIRECTORY  U13022658_DIR AS '/exports/orcloz';
+
+select * from all_directories;
+
+-- creating dbp_parameter table and inputting parameter (Category code value) into the table
+CREATE TABLE dbp_parameter 
+(
+    CATEGORY                VARCHAR2(35), 
+    code                    VARCHAR2(35), 
+    VALUE                   VARCHAR2(35), 
+    ACTIVE                  VARCHAR2(1) default 'Y' CONSTRAINT active_CK CHECK (active IN('Y','N')), 
+    CREATED                 DATE  default sysdate, 
+    Modified_by             VARCHAR2(25) default USER 
+ ); 
+ 
+DROP TABLE dbp_parameter;
+ALTER TABLE dbp_parameter 
+   MODIFY  VALUE VARCHAR2(100);
+
+
+   INSERT INTO dbp_parameter 
+    ( 
+        CATEGORY, 
+        CODE, 
+        VALUE
+    ) 
+    values 
+    (
+      'ANNOUNCEME', 
+      'DAILYSETTLEMENT', 
+      'Settling transaction for '
+    ); 
+
+SELECT * FROM DBP_PARAMETER;
+
+-- FSS_DAILY TRANSACTION, copy new transaction data from FSS_TRANSACTION to FSS_DAILY_TRANSACTION
+CREATE  TABLE FSS_DAILY_TRANSACTION
+(
+    TRANSACTIONNR           NUMBER      PRIMARY KEY,
+    DOWNLOADDATE            DATE,
+    TERMINALID              VARCHAR2(10),
+    CARDID                  VARCHAR2 (17),
+    TRANSACTIONDATE         DATE,
+    CARDOLDVALUE            NUMBER,
+    TRANSACTIONAMOUNT       NUMBER,
+    CARDNEWVALUE            NUMBER,
+    TRANSACTIONSTATUS       VARCHAR2(1),
+    ERRORCODE               VARCHAR2(32),
+    LodgementRef           VARCHAR2(15)
+    
+);
+
+DROP TABLE FSS_DAILY_TRANSACTION;
+
+-- FSS_DAILY SETTLEMENT Storing the results of transaction settlement run
+CREATE TABLE FSS_DAILY_SETTLEMENT
+(
+   
+    RECORDTYPE              VARCHAR2(1),
+    BSB                    VARCHAR2(7),
+    ACCOUNTNR             VARCHAR2(9),
+    TRANSACTION_CODE       VARCHAR2(2),
+    SETTLEMENT_VALUE       NUMBER,
+    MERCHANTID             NUMBER,
+    MERCHANTTITLE          VARCHAR2(35),
+    BANKFLAG               VARCHAR2(3),
+    LodgementRef           VARCHAR2(15) PRIMARY KEY,
+    TRACENUM               VARCHAR2(16),
+    REMITTER               VARCHAR2(16),
+    GSTTAX                 VARCHAR2(8),
+    SETTLEDATE             DATE,
+    DESKBANKFLAG           VARCHAR2(3)
+);
+
+DROP TABLE FSS_DAILY_SETTLEMENT;
+
+--FSS_RUN TABLE, to keep track so that daily settlement can only be run once in a day, and to produce runoutcome, remarks of why the program failed
+CREATE  TABLE FSS_RUN_TABLE
+(
+    RUNID                   NUMBER      PRIMARY KEY,
+    RUNSTART                DATE        NOT NULL,
+    RUNEND                  DATE,
+    RUNOUTCOME              VARCHAR2(15),
+    REMARKS                 VARCHAR2(255)
+);
+
+DROP TABLE FSS_RUN_TABLE;
+
+-- select * statement
+SELECT * FROM FSS_MERCHANT;
+
+SELECT * FROM FSS_REFERENCE;
+
+SELECT * FROM FSS_ORGANISATION;
+
+SELECT * FROM FSS_TERMINAL;
+SELECT * FROM FSS_TERMINAL_TYPE;
+
+SELECT * FROM FSS_DESKBANK_REF;
+
+TRUNCATE TABLE FSS_DAILY_SETTLEMENT;
+TRUNCATE TABLE FSS_DAILY_TRANSACTION;
+TRUNCATE TABLE FSS_RUN_TABLE;
+
+-- Package header for Pkg_FSS_Settlement
+CREATE OR REPLACE PACKAGE Pkg_FSS_Settlement IS
+
+    PROCEDURE DailySettlement;
+    PROCEDURE DailyBankingSummary(p_report_date VARCHAR2);
+    PROCEDURE TerminalUsage;
+
+END Pkg_FSS_Settlement;
+
+select * from DBP_MESSAGE_LOG
+WHERE STUDENT_ID = 'U13022658'
+ORDER BY MSG_DATE DESC;
+--Package body for Pkg_FSS_Settlement
+
+CREATE OR REPLACE PACKAGE BODY Pkg_FSS_Settlement IS
+
+ --------Forward declaration of all private procedure and function
+PROCEDURE announceme(p_module_name VARCHAR2, p_destination VARCHAR2 default get_param('ANNOUNCEME', 'DESTINATION'));
+PROCEDURE upload_new_transactions;
+PROCEDURE settle_transactions;
+PROCEDURE check_run_table(p_program_id IN OUT NUMBER);
+PROCEDURE upload_lodgementref(p_merchantid   IN NUMBER, p_lodgementref IN VARCHAR2);
+PROCEDURE upload_deskbankflag(p_lodgementref IN VARCHAR2);
+PROCEDURE debit_transaction(p_debit IN NUMBER);  
+PROCEDURE run_log_failed (p_remark IN VARCHAR2);
+PROCEDURE create_deskbank;
+PROCEDURE send_email_with_attachment( p_report_date DATE DEFAULT SYSDATE);
+
+FUNCTION get_lodgementref RETURN VARCHAR2;
+FUNCTION format_currency(p_currency IN NUMBER) RETURN VARCHAR2;
+FUNCTION format_bsb (p_bsb IN  VARCHAR2) RETURN VARCHAR2;
+FUNCTION create_deskheader RETURN VARCHAR2;
+FUNCTION create_deskfooter(p_debit IN NUMBER, p_credit IN NUMBER, p_numrecords IN NUMBER) RETURN VARCHAR2;
+--------Forward declaration of all private procedure and function
+
+--- Definition of all private procedure and function
+
+PROCEDURE announceme (p_module_name VARCHAR2, p_destination VARCHAR2 default get_param('ANNOUNCEME', 'DESTINATION')) IS
+--purpose:  This module print out message to inform me, where the program is currently at
+--          By default it will print message to DBP_MESSAGE_LOG Table, using common.log procedure
+--          However, we can also set the message into the dbms output (don't forget to set serveroutput on), by changing the destination parameter
+-- Author: based on the code shown on lecture, Laurie
+
+    v_message           VARCHAR2(500) := get_param('MODULENAME', 'STARTMESSAGE') || p_module_name; --variable containing the message, intended to tell in which module the program is at
+
+BEGIN
+    IF p_destination = get_param('ANNOUNCEME', 'DESTINATION') then 
+        common.log(v_message);  
+    ELSE
+        DBMS_OUTPUT.PUT_LINE(v_message);
+    END IF;
+    
+END announceme;
+
+PROCEDURE run_log_failed (p_remark IN VARCHAR2) IS
+-- purpose: Procedure to log message, if the run has failed for any reason, as well as updating the FSS_RUN_TABLE
+--          to show that program failed to run, and inform that error message will be run to log table
+--          the difference with common.log method, is that this method also update run table that program failed to run
+-- Author: This method is based on kaz yamada works from github, run failed, with changes that the update goes to log table, instead of run table
+
+    v_runlogID          NUMBER; 
+    v_module_name       VARCHAR2(35) := get_param('MODULENAME', 'RUN_LOG_FAILED'); 
+
+BEGIN
+ 
+    Announceme(v_module_name || p_remark); -- the logging process starts here, use common.log from announceme
+   
+    SELECT RUNID INTO v_runLogID FROM FSS_RUN_TABLE 
+    WHERE  TO_CHAR(RUNEND, get_param('DATEFORMAT', 'CHECKEQUAL')) =  TO_CHAR(SYSDATE, get_param('DATEFORMAT', 'CHECKEQUAL')); -- Condition when RUNEND equal to SYSDATE, we use dateformat, to avoid to many precision point
+      
+    UPDATE FSS_RUN_TABLE -- updating FSS_RUN_TABLE with FAILED STATUS, at the runid, with error message from remark parameter
+    SET RUNEND      = sysdate,
+         RUNOUTCOME  = get_param('RUNOUTCOME', 'FAILED'), -- FAILED
+        REMARKS     = get_param('REMARKS', 'FAILED') --Program Failed to Run
+    WHERE RUNID = v_runLogID; 
+    
+END;
+
+PROCEDURE check_run_table (p_program_id IN OUT NUMBER) IS
+-- purpose: Procedure to check whether the program has been run today, from the run table
+--          settlement of transaction can only be done once a day
+--          Note that the parameter are in out, meaning that the variable at another method, can be overwritten by this one
+--          In this method, p_program_id and p_run_log_record will be initialized
+-- Author: Based on Tutorial 5
+
+    v_module_name      VARCHAR2(35) := get_param('MODULENAME', 'CHECK_RUN_TABLE');  
+    v_error_msg        VARCHAR2(35);   
+    v_run_log_record    FSS_RUN_TABLE%ROWTYPE; 
+    
+    MODULERAN          EXCEPTION; -- user defined exception if the module has already been ran
+
+BEGIN
+   Announceme(v_module_name || get_param('ANNOUNCEME','RUNTABLE')); 
+   
+   BEGIN -- inner child block
+      SELECT * INTO v_run_log_record 
+      FROM FSS_RUN_TABLE                              
+      WHERE RUNOUTCOME = get_param('RUNOUTCOME', 'SUCCESS') -- if the outcome is successful
+      AND  TO_CHAR(RUNEND, get_param('DATEFORMAT', 'CHECKEQUAL')) =  TO_CHAR(SYSDATE, get_param('DATEFORMAT', 'CHECKEQUAL')); -- Condition when RUNEND equal to SYSDATE to avoid to many precision point
+     
+     RAISE MODULERAN; -- if it raises here than the module has been ran, raise exception
+ 
+    EXCEPTION 
+      WHEN NO_DATA_FOUND THEN 
+         p_program_ID := FSS_RUNLOG_SEQ.NEXTVAL; -- getting the next  id from the FSS_RUNLOG_SEQ sequence, similar to the record variable, this one will also be changed since it's an out setting
+         INSERT INTO FSS_RUN_TABLE(RUNID, RUNSTART, RUNEND, RUNOUTCOME, REMARKS) 
+         VALUES ( p_program_ID, SYSDATE, NULL, NULL, get_param('REMARKS', 'STARTPROGRAM')); -- initialising the row with the starting information
+    END; 
+    -- if module not ran, and no data found exception is executed, it will go back to the parent block below
+     
+        UPDATE FSS_RUN_TABLE 
+        SET RUNEND      = sysdate,
+            RUNOUTCOME  = get_param('RUNOUTCOME', 'SUCCESS'), 
+            REMARKS     = get_param('REMARKS', 'SUCCESS')
+        WHERE RUNID = p_program_ID; 
+      
+      
+EXCEPTION    
+    WHEN MODULERAN THEN
+        p_program_ID := TO_NUMBER(get_param('MODULERAN', 'RAISE')); -- setting program id to 0, to mark that program has been run today
+        announceme(get_param('ANNOUNCEME', 'MODULERAN') ||v_run_log_record.RUNSTART ); 
+        
+     WHEN OTHERS THEN -- others exception
+        run_log_failed( get_param('REMARKS', 'EXCEPTION1')||v_module_name||get_param('REMARKS', 'EXCEPTION2')||SQLERRM); 
+        
+END check_run_table; 
+
+FUNCTION format_bsb (p_bsb IN  VARCHAR2) RETURN VARCHAR2 IS
+--purpose: To return formatted bsb number from xxxxxx to xxx-xxx
+--Author: original
+
+    v_module_name   VARCHAR2 (35) := get_param('MODULENAME', 'FORMAT_BSB'); -- getting function module name
+    v_bsb           VARCHAR2(7); -- storing  bsb value from parameter
+
+BEGIN
+    Announceme( v_module_name ||get_param('ANNOUNCEME', 'BSB') ||  v_bsb ||  get_param('ANNOUNCEME', 'BSB2')); 
+    v_bsb := p_bsb; -- bsb variable initialisation
+    RETURN TO_CHAR(SUBSTR(v_bsb, 1, 3) || get_param('GENERAL', 'DASH1') ||SUBSTR(v_bsb, 4, 3) ); -- return bsb with the intended format, using substring
+ 
+EXCEPTION
+    WHEN OTHERS THEN 
+     run_log_failed( get_param('REMARKS', 'EXCEPTION1')||v_module_name||get_param('REMARKS', 'EXCEPTION2')||SQLERRM); 
+
+ END;
+
+FUNCTION format_currency(p_currency IN NUMBER) RETURN VARCHAR2 IS
+ --purpose: To return formatt currency number in cents to dollar
+ --Author: original
+
+ v_module_name   VARCHAR2 (35) := get_param('MODULENAME', 'FORMAT_CURRENCY'); 
+ 
+BEGIN
+    Announceme( v_module_name); -- starting to format currency
+    RETURN TO_CHAR(p_currency,get_param('CURRENCY', 'FORMAT')); --in this scenario the format that I used are '$9,999,999,999.00'
+                                                                -- HOWEVER if for any reason the currency value is bigger than this, it will produce ######, during testing
+EXCEPTION
+   WHEN OTHERS THEN -- others exception
+        run_log_failed( get_param('REMARKS', 'EXCEPTION1')||v_module_name||get_param('REMARKS', 'EXCEPTION2')||SQLERRM); 
+END; 
+  
+PROCEDURE debit_transaction(p_debit IN NUMBER) IS
+--Purpose: procedure uploads debit transaction, from the organisation
+-- organisation data can be found from FSS_ORGANISATION
+-- similar to settle transaction, the only difference is that is for debit, data located in another table, which is why
+-- making another method seems a suitable option for this transaction, although it's still possible if this is done in settle transaction
+-- by adding the variable in the settle transaction method, deploy query, and write an if condition
+--Author: original
+
+    v_module_name  VARCHAR2(35) := get_param('MODULENAME', 'DEBIT_TRANSACTION');
+    v_lodgeref     VARCHAR2(15); 
+    r_organisation  FSS_ORGANISATION%ROWTYPE; -- record data type, type correspond to FSS_ORGANISATIONN TABLE
+    v_bsb          VARCHAR2(7);  -- store  formatted ORGBSGNR  
+BEGIN
+    Announceme(v_module_name||get_param('ANNOUNCEME', 'DEBITTRANSACTION'));  
+    v_lodgeref := get_lodgementref; -- get next value of lodgementref number from the FSS_LODGE_SEQ
+    
+    SELECT ORGACCOUNTTITLE, ORGBSBNR, ORGBANKACCOUNT 
+      INTO r_organisation.ORGACCOUNTTITLE,r_organisation.ORGBSBNR, r_organisation.ORGBANKACCOUNT
+      FROM FSS_ORGANISATION
+     WHERE ORGNR = TO_NUMBER(get_param('ORGANISATION', 'ORGNR'));  -- get the organisation that debit the transaction    
+     
+     v_bsb := format_bsb(r_organisation.ORGBSBNR); 
+     
+        INSERT INTO FSS_DAILY_SETTLEMENT 
+        (
+            RECORDTYPE, 
+            BSB,  --bsb formatted
+            ACCOUNTNR, 
+            TRANSACTION_CODE, -- debit transaction code 50
+            SETTLEMENT_VALUE, 
+            MERCHANTTITLE,
+            BANKFLAG, 
+            LodgementRef, 
+            TRACENUM, 
+            REMITTER, 
+            GSTTAX,
+            SETTLEDATE, -- settlement date
+            DESKBANKFLAG -- flag for marking that the settled merchant transaction has been included in the deskbank file, precaution
+                         -- in case when the run table for special reason is run on the same day, but there's a new unsettle transaction
+                         -- that need to be settled on the second run, the deskbank file will only send the deskbank for the new settled transaction
+        )
+        VALUES
+        (
+            get_param('DESKBODY', 'RECORDTYPE'),
+            v_bsb,
+            r_organisation.ORGBANKACCOUNT,
+            get_param('DESKBODY', 'TRANSACTION_DEBIT'),
+            p_debit,
+            r_organisation.ORGACCOUNTTITLE,
+            get_param('DESKBODY', 'BANKFLAGDEBIT'),
+            v_lodgeref,
+            get_param('DESKBODY', 'TRACE'),
+            get_param('DESKBODY', 'REMITTER'),
+            get_param('DESKBODY', 'GST TAX'),
+            SYSDATE,
+            get_param('DESKBANKFLAG', 'NO')
+        );
+   
+EXCEPTION 
+      WHEN OTHERS THEN -- others exception
+        run_log_failed( get_param('REMARKS', 'EXCEPTION1')||v_module_name||get_param('REMARKS', 'EXCEPTION2')||SQLERRM); -- send message to log specifying what the error is
+END;
+
+PROCEDURE upload_lodgementref(p_merchantid IN NUMBER, p_lodgementref IN VARCHAR2) IS  
+--purpose: updating FSS_DAILY_TRANSACTION lodgementreference number, to mark that the transaction has been settled by the program, as well as showing which transaction are settled
+--preventing duplicated settlement by marking settled data
+--Author: original
+  
+  v_module_name     VARCHAR2(35) := get_param('MODULENAME', 'UPLOAD_LODGEMENTNR'); 
+  
+BEGIN
+    Announceme(v_module_name|| get_param('ANNOUNCEME', 'UPLOADLODGE1')|| p_lodgementref ||get_param('ANNOUNCEME', 'UPLOADLODGE2')|| p_merchantid);  
+  
+       UPDATE FSS_DAILY_TRANSACTION FDT -- update DAILY TRANSACTION
+       SET FDT.LodgementRef = p_lodgementref -- set lodgementref from daily transaction equal to lodgement num parameter generated from settle transaction
+       WHERE  EXISTS  (SELECT p_merchantid -- if merchant id exists at the terminal from daily transaction
+                     FROM FSS_TERMINAL TERM
+                    WHERE TERM.MERCHANTID = p_merchantid 
+                      AND FDT.TERMINALID= TERM.TERMINALID 
+                      AND FDT.LodgementRef IS NULL);  -- when lodgemenref is null, because we don't want to change the existing settled transaction lodgement number
+                                                      -- which have the same merchantid.
+EXCEPTION 
+    WHEN OTHERS THEN 
+        run_log_failed( get_param('REMARKS', 'EXCEPTION1')||v_module_name||get_param('REMARKS', 'EXCEPTION2')||SQLERRM); 
+ END;
+
+PROCEDURE upload_deskbankflag(p_lodgementref IN VARCHAR2) IS
+--purpose: updating FSS_DAILY_TRANSACTION lodgementref, to mark that the transaction has been settled by the program, as well as showing which transaction are settled
+-- This is so that, if for any special reason, the run table is run again on the same day, and there's a new unsettled transaction in the same day, it will only generate
+-- deskbank file for that new settlement, and without the old one, if there isn't any new transaction, then it won't create a deskbank file
+-- data renew every 7pm
+--Author: original
+
+  v_module_name     VARCHAR2(35) := get_param('MODULENAME', 'UPLOADDESKBANKFLAG'); -- get procedure module name
+BEGIN
+ Announceme(v_module_name );  -- start upload lodgementnr   
+ 
+     UPDATE FSS_DAILY_SETTLEMENT FDS -- update DAILY TRANSACTION
+     SET FDS.DESKBANKFLAG  = get_param('DESKBANKFLAG', 'YES') 
+     WHERE  FDS.LODGEMENTREF  = p_lodgementref;
+
+EXCEPTION 
+    WHEN OTHERS THEN 
+        run_log_failed( get_param('REMARKS', 'EXCEPTION1')||v_module_name||get_param('REMARKS', 'EXCEPTION2')||SQLERRM);
+        
+END upload_deskbankflag;
+
+FUNCTION get_lodgementref RETURN VARCHAR2 IS
+--Purpose: Function returns the next unique lodgement number from FSS_LODGE_SEQ WITH YYYYMMDD + 0000000(length 7) contenation
+--Author: original
+
+  v_module_name  VARCHAR2(50) := get_param('MODULENAME', 'GETLODGEMENTREF');  
+  
+BEGIN        
+    Announceme(v_module_name|| get_param('ANNOUNCEME', 'GETLODGEREF1'));   
+    RETURN TO_CHAR(TO_CHAR(sysdate, get_param('DATEFORMAT', 'LODGEMENT')) || LPAD(FSS_LODGE_SEQ.NEXTVAL, 7, '0'));  -- sysdate + lodge seq number
+                                                                                        
+EXCEPTION 
+    WHEN OTHERS THEN 
+    run_log_failed( get_param('REMARKS', 'EXCEPTION1')||v_module_name||get_param('REMARKS', 'EXCEPTION2')||SQLERRM);
+    
+END; 
+
+PROCEDURE settle_transactions IS
+-- purpose: Settling unsettled transaction from FSS_DAILY_TRANSACTION and  update them to the FSS_DAILY SETTLEMENT
+--          It also generates a deskbank file, deskbank summary, and terminal usage report automatically, when it's run
+-- Author: based on code shown on lecture, with some modification
+
+    v_module_name       VARCHAR2(35)     := get_param('MODULENAME', 'SETTLE_TRANSACTION'); 
+    v_nrRecords         NUMBER           := 0;
+    v_credit            NUMBER           := 0; 
+    v_bsb_formatted     VARCHAR2(7);
+    v_minimum_settle    NUMBER;  
+    v_lodgeref          VARCHAR2(15); 
+     
+    no_settlement       EXCEPTION;
+     
+   CURSOR c_merchant_totals IS -- cursor for obtaining necessary non hard-coded data to update DAILY SETTLEMENT TABLE
+        SELECT M.MERCHANTBANKBSB BSB, 
+               M.MERCHANTBANKACCNR ACCOUNT, 
+               M.MERCHANTID MERCHANTID,
+               SUBSTR(M.MERCHANTLASTNAME, 1, 32)NAME, 
+               SUM (FDT.TRANSACTIONAMOUNT) TOTAL 
+        FROM FSS_MERCHANT M JOIN FSS_TERMINAL T  ON   M.MERCHANTID = T.MERCHANTID 
+                            JOIN FSS_DAILY_TRANSACTION FDT ON T.TERMINALID = FDT.TERMINALID
+        WHERE  LodgementRef   IS NULL      -- cursor only obtain unsettled transaction, we mark settle transaction using lodgementref
+        GROUP BY M.MERCHANTBANKBSB,  -- grouping by merchant, so all the transaction on daily settlement is on merchant level
+               M.MERCHANTBANKACCNR,
+                M.MERCHANTID,
+               SUBSTR(M.MERCHANTLASTNAME, 1, 32);
+               
+BEGIN
+    Announceme(v_module_name); -- starting settle transaction
+    
+    SELECT TO_NUMBER(REPLACE(REFERENCEVALUE,get_param('GENERAL', 'DOT'),'')) INTO v_minimum_settle
+    FROM FSS_REFERENCE WHERE REFERENCEID=get_param('REFERENCE','ID'); -- choose reference ID DMIN, we want to convert the DMIN value to number, which is why the dot has to dissapear
+    FOR r_merchant_total IN  c_merchant_totals LOOP 
+        IF r_merchant_total.TOTAL > v_minimum_settle THEN 
+         
+        v_credit        := v_credit + r_merchant_total.TOTAL; 
+        v_nrRecords     :=  v_nrRecords + 1; 
+        v_lodgeref      :=  get_lodgementref; 
+        v_bsb_formatted := format_bsb(r_merchant_total.BSB); 
+
+        
+        -- inserting information to FSS_DAILY SETTLEMENT
+        INSERT INTO FSS_DAILY_SETTLEMENT --contain the data for deskbank file
+        (
+            RECORDTYPE, 
+            BSB,  --bsb formatted
+            ACCOUNTNR, 
+            TRANSACTION_CODE, -- credit transaction code 13
+            SETTLEMENT_VALUE, 
+            MERCHANTID, 
+            MERCHANTTITLE, 
+            BANKFLAG, 
+            LodgementRef, -- lodgement reference number, link all the transactions for a merchant throughout the daily settlement
+            TRACENUM, 
+            REMITTER, 
+            GSTTAX, 
+            SETTLEDATE, -- settlement date
+            DESKBANKFLAG -- flag for marking that the settled merchant transaction has been included in the deskbank file, precaution
+                         -- in case when the run table for special reason is run on the same day, but there's a new unsettle transaction
+                         -- that need to be settled on the second run, the deskbank file will only send the deskbank for the new settled transaction
+        )
+        VALUES
+        (
+            get_param('DESKBODY', 'RECORDTYPE'),
+            v_bsb_formatted,
+            r_merchant_total.ACCOUNT,
+            get_param('DESKBODY', 'TRANSACTION_CREDIT'),
+            r_merchant_total.TOTAL,
+            r_merchant_total.MERCHANTID,
+            r_merchant_total.NAME,
+            get_param('DESKBODY', 'BANKFLAGCREDIT'),
+            v_lodgeref,
+            get_param('DESKBODY', 'TRACE'),
+            get_param('DESKBODY', 'REMITTER'),
+            get_param('DESKBODY', 'GST TAX'),
+            SYSDATE, 
+            get_param('DESKBANKFLAG', 'NO')
+        ); 
+    
+        upload_lodgementref(r_merchant_total.merchantid, v_lodgeref ); -- upload new lodgement ref to fss daily transaction
+      END IF;
+     END LOOP;
+     
+     IF v_nrRecords > 0 THEN  -- check to see if there's any settled transaction    
+     debit_transaction(v_credit); -- debit transaction if num of records bigger than 1, amount of debit is equal to amount of credit
+      
+    COMMIT;
+      
+    create_deskbank; 
+    TerminalUsage;
+       
+    ELSE
+    RAISE no_settlement; 
+        
+    END IF;
+      
+EXCEPTION 
+   WHEN no_settlement THEN 
+     common.log(get_param('EXCEPTION', 'NOSETTLEMENT')); -- just send information to log table that no settlement is done when program is run
+   WHEN OTHERS THEN 
+     run_log_failed( get_param('REMARKS', 'EXCEPTION1')|| v_module_name ||get_param('REMARKS', 'EXCEPTION2')||SQLERRM); 
+
+END settle_transactions;
+
+PROCEDURE upload_new_Transactions is 
+--Purpose : Upload any new transactions from the fss_transactions into fss_daily_transaction
+-- transaction updates everyday on 7pm
+--Author: Laurie from UTS ONLINE
+
+v_module_name VARCHAR2(35) := get_param('MODULENAME', 'UPLOAD_NEW_TRANSACTION'); 
+
+BEGIN 
+    announceme(v_module_name);  
+    INSERT INTO FSS_DAILY_TRANSACTION -- inserting new transaction from fss_transaction to daily transaction
+                (
+                    TRANSACTIONNR, 
+                    DOWNLOADDATE, 
+                    TERMINALID, 
+                    CARDID, 
+                    TRANSACTIONDATE, 
+                    CARDOLDVALUE, 
+                    TRANSACTIONAMOUNT, 
+                    CARDNEWVALUE, 
+                    TRANSACTIONSTATUS, 
+                    ERRORCODE
+                ) 
+                
+    SELECT      T1.TRANSACTIONNR, 
+                T1.DOWNLOADDATE, 
+                T1.TERMINALID, 
+                T1.CARDID, 
+                T1.TRANSACTIONDATE, 
+                T1.CARDOLDVALUE, 
+                T1.TRANSACTIONAMOUNT, 
+                T1.CARDNEWVALUE, 
+                T1.TRANSACTIONSTATUS, 
+                T1.ERRORCODE 
+                
+    FROM FSS_TRANSACTIONS T1              
+    WHERE NOT EXISTS (
+                        SELECT 1                  
+                        FROM FSS_DAILY_TRANSACTION T2                  
+                        WHERE T1.transactionnr = T2.transactionnr
+                     );
+    
+    COMMIT;  
+
+EXCEPTION 
+   WHEN OTHERS THEN 
+     run_log_failed( get_param('REMARKS', 'EXCEPTION1')||v_module_name||get_param('REMARKS', 'EXCEPTION2')||SQLERRM); 
+
+        
+END upload_new_transactions;
+
+FUNCTION create_deskheader RETURN VARCHAR2 IS
+--purpose: generate the  header for deskbank file
+--author: original
+
+    v_module_name       VARCHAR2(35) := get_param('MODULENAME', 'DESKBANKHEADER'); 
+    v_header            VARCHAR2(120); 
+     
+BEGIN
+    Announceme( v_module_name); 
+           
+             v_header:=         
+                        
+                        get_param('HEADERDESK', 'RECORDTYPE')                                             ||
+                        RPAD(get_param('GENERAL', 'SPACE'), 17)                                           ||
+                        get_param('HEADERDESK', 'REEL_SEQUENCE')                                          ||
+                        get_param('HEADERDESK','F.I.CODE' )                                               ||
+                        RPAD(get_param('GENERAL', 'SPACE'), 7)                                            ||
+                        RPAD(get_param('HEADERDESK', 'USER'), 26, get_param('GENERAL', 'SPACE'))          ||
+                        get_param('HEADERDESK', 'USERBSB')                                                ||
+                        RPAD(get_param('HEADERDESK', 'DESCRIPTION'), 12, get_param('GENERAL', 'SPACE'))   ||
+                        TO_CHAR(SYSDATE, get_param('DATEFORMAT', 'PLAIN2'));
+ 
+RETURN v_header; 
+
+EXCEPTION 
+   WHEN OTHERS THEN 
+     run_log_failed( get_param('REMARKS', 'EXCEPTION1')||v_module_name||get_param('REMARKS', 'EXCEPTION2')||SQLERRM); 
+     
+END create_deskheader;
+
+FUNCTION create_deskfooter (p_debit IN NUMBER, p_credit IN NUMBER, p_numrecords IN NUMBER) RETURN VARCHAR2 IS
+--purpose: generate footer for deskbank file
+--author: original
+
+    v_module_name       VARCHAR2(35) := get_param('MODULENAME', 'DESKBANKFOOTER'); -- get module name
+    v_footer            VARCHAR2(120); -- store footer
+    v_numrecords        NUMBER := 0;
+    v_debit             NUMBER :=0 ;
+    v_credit            NUMBER:=0;
+    
+BEGIN
+     Announceme( v_module_name);  
+     v_numrecords := p_numrecords; 
+     v_debit      := p_debit;
+     v_credit     := p_credit;
+    
+    v_footer:= 
+                        get_param('FOOTERDESK', 'TYPE')                                                    ||
+                        get_param('FOOTERDESK','FILLER')                                                   ||
+                        RPAD(get_param('GENERAL', 'SPACE'), 12)                                            ||     
+                        LPAD(v_credit - v_debit,10, get_param('GENERAL', 'ZERO'))                          ||
+                        LPAD(v_credit,10, get_param('GENERAL', 'ZERO'))                                    ||
+                        LPAD(v_debit,10,get_param('GENERAL', 'ZERO'))                                      ||
+                        RPAD(get_param('GENERAL', 'SPACE'),24)                                             ||
+                        LPAD(v_numrecords,6, get_param('GENERAL', 'ZERO'))                                 ||
+                        RPAD(get_param('GENERAL', 'SPACE'),40)                                              ;
+            
+RETURN v_footer; 
+
+EXCEPTION 
+  WHEN OTHERS THEN 
+     run_log_failed( get_param('REMARKS', 'EXCEPTION1')||v_module_name||get_param('REMARKS', 'EXCEPTION2')||SQLERRM); 
+
+END create_deskfooter;
+
+PROCEDURE create_deskbank  IS
+-- purpose: create complete deskbank file
+-- author: original
+    v_module_name           VARCHAR2(35) := get_param('MODULENAME', 'CREATE_DESKBANK'); 
+    v_deskbank_filename     VARCHAR2(30) := get_param('FILENAME', 'DESKBANK') || TO_CHAR(SYSDATE, get_param('DATEFORMAT', 'FILENAME')) || get_param('EXTENSION', 'DESKBANK'); 
+    v_credit                NUMBER :=0; 
+    v_nrRecords             NUMBER :=0; 
+    v_debit                 NUMBER :=0;
+    v_input_line            VARCHAR2(5000); 
+    v_file                  utl_file.file_type;  
+    no_unsent_settlement    EXCEPTION;
+   
+    
+    CURSOR c_settlements IS -- cursor variable, containing all information needed for deskbank from fss_daily settlement
+      SELECT RECORDTYPE,
+            BSB,
+            ACCOUNTNR,
+            TRANSACTION_CODE,
+            SETTLEMENT_VALUE,
+            MERCHANTID,
+            MERCHANTTITLE,
+            BANKFLAG,
+            LodgementRef,
+            TRACENUM,
+            REMITTER,
+            GSTTAX         
+        FROM FSS_DAILY_SETTLEMENT
+       WHERE TO_CHAR(SETTLEDATE, get_param('DATEFORMAT', 'CHECKEQUAL')) =  TO_CHAR(SYSDATE, get_param('DATEFORMAT', 'CHECKEQUAL')) 
+             AND DESKBANKFLAG = get_param('DESKBANKFLAG', 'NO'); -- and hasn't been sent or outputted to a deskbankfile
+
+BEGIN
+    Announceme(v_module_name||get_param('ANNOUNCEME', 'DESKBANK1')||to_char(SYSDATE, get_param('DATEFORMAT','DASHES'))); -- get module name
+     
+  FOR r_settlement IN c_settlements LOOP
+          v_nrRecords := v_nrRecords + 1;
+  END LOOP;
+    
+  IF v_nrRecords > 0 THEN
+     v_file := utl_file.fopen (get_param('DIRECTORY', 'ORCLOZ'),v_deskbank_filename, get_param('UTLFILE', 'WRITE'));  -- open deskbank file
+     v_input_line := create_deskheader; -- put header to buffer
+     utl_file.put_line(v_file, v_input_line);  -- put the header data to file using put line
+     
+     FOR r_settlement IN c_settlements LOOP -- cursor for loop
+          v_input_line := 
+                                    r_settlement.RECORDTYPE                                                      || -- put data to input line
+                                    r_settlement.BSB                                                             ||
+                                    r_settlement.ACCOUNTNR                                                       || 
+                                    get_param('GENERAL', 'SPACE')                                                ||
+                                    r_settlement.TRANSACTION_CODE                                                ||
+                                    LPAD(r_settlement.SETTLEMENT_VALUE,10,get_param('GENERAL', 'ZERO'))          ||
+                                    RPAD(r_settlement.MERCHANTTITLE,32,get_param('GENERAL', 'SPACE'))            ||
+                                    r_settlement.BANKFLAG                                                        ||
+                                    get_param('GENERAL', 'SPACE')                                                ||
+                                    r_settlement.LODGEMENTREF                                                    ||
+                                    r_settlement.TRACENUM                                                        ||
+                                    r_settlement.REMITTER                                                        ||
+                                   get_param('GENERAL', 'SPACE')                                                 ||
+                                    r_settlement.GSTTAX;
+                                    
+                  
+                
+           IF r_settlement.TRANSACTION_CODE = get_param('DESKBODY', 'TRANSACTION_CREDIT') THEN -- if code 50 (credit)
+             v_credit := v_credit + r_settlement.SETTLEMENT_VALUE; 
+           ELSE   
+             v_debit := v_debit + r_settlement.SETTLEMENT_VALUE;
+           END IF;
+        
+           utl_file.put_line(v_file, v_input_line); 
+           
+           upload_deskbankflag(r_settlement.LodgementRef); -- update deskbank flag to prevent it from being entered to deskbank again
+           
+        END LOOP;
+        
+           
+     v_input_line := create_deskfooter(v_debit, v_credit, v_nrRecords); -- put footer to buffer
+     utl_file.put_line(v_file, v_input_line); 
+          
+     utl_file.fclose(v_file); -- close file
+      DailyBankingSummary(); -- automatically produce desk bank summary if the deskbank file is created
+      
+    ELSE
+       RAISE no_unsent_settlement; -- if number of records equal to zero raise this exception
+       
+   END IF;
+      
+EXCEPTION
+ WHEN no_unsent_settlement THEN
+    common.log(TO_CHAR(get_param('EXCEPTION', 'NOUNSEND1') || SYSDATE || get_param('EXCEPTION', 'NOUNSEND2') )); -- just send information to log table that all settlement today has been sent
+                                                                                                     -- prevent deskbank from being generated
+ WHEN OTHERS THEN 
+    utl_file.fclose(v_file); 
+    run_log_failed( get_param('REMARKS', 'EXCEPTION1')||v_module_name||get_param('REMARKS', 'EXCEPTION2')||SQLERRM); 
+
+END create_deskbank;
+
+PROCEDURE send_email_with_attachment(p_report_date DATE DEFAULT SYSDATE) IS
+--purpose: send deskbank summary to a specified email 
+--author: based on materials on UTS ONLINE with attachment modification
+--get_param('EMAIL', 'RECIPIENT'),for testing, please change the value of this email to the appropriate one in dbp parameter ;
+    v_module_name              VARCHAR2(35) := get_param('MODULENAME', 'SENDEMAIL');
+    con_email_server           VARCHAR2(50) := get_param('EMAIL', 'SERVER'); 
+    con_nl                     VARCHAR2(2) :=   CHR(13)||CHR(10); -- new line buffer
+    con_email_footer           VARCHAR2(250) := get_param('EMAIL', 'FOOTER');
+     
+    v_subject                  VARCHAR2 (50)  :=get_param('EMAIL', 'SUBJECTCONTENT') ;
+    v_sender                   VARCHAR2 (50) :=get_param('EMAIL', 'SENDER') ; -- sender (procedure@uts.edu.au)
+    v_recipient                VARCHAR2 (50) :=get_param('EMAIL', 'RECIPIENT') ; 
+    v_connection               UTL_SMTP.CONNECTION; 
+    v_boundary_text            VARCHAR2(35) := get_param('EMAIL', 'BOUNDARY'); 
+    v_filename              VARCHAR2(35) := get_param('FILENAME', 'DAILYBANK')||TO_CHAR(p_report_date, get_param('DATEFORMAT', 'FILENAME')) ||get_param('EXTENSION', 'DAILYBANK'); 
+    v_attachment               VARCHAR2(35) := get_param('EMAIL', 'FILENAME')||TO_CHAR(p_report_date,get_param('EMAIL', 'DATEFORMAT')) ||get_param('EMAIL', 'EXTENSION'); 
+    v_input_line               VARCHAR2(500); 
+    v_file                     utl_file.file_type;   -- pointer to utl file deskbank summary
+    
+
+BEGIN
+  announceme(v_module_name);
+  v_connection := UTL_SMTP.OPEN_CONNECTION(con_email_server, 25);
+  UTL_SMTP.HELO(v_connection,con_email_server);
+  UTL_SMTP.mail ( v_connection, v_sender); -- set sender
+  UTL_SMTP.rcpt ( v_connection, v_recipient); -- set recipient
+  
+  v_file := UTL_FILE.FOPEN(get_param('DIRECTORY', 'ORCLOZ'),v_filename,get_param('UTLFILE', 'READ')); -- open utl file
+  
+   UTL_SMTP.open_data ( v_connection); -- open connection
+         UTL_SMTP.write_data ( v_connection, get_param('EMAIL', 'FROM') || v_sender|| con_nl); -- write data
+         UTL_SMTP.write_data ( v_connection,get_param('EMAIL', 'TO')|| v_recipient|| con_nl);
+         UTL_SMTP.write_data ( v_connection,get_param('EMAIL', 'SUBJECT')|| v_subject||con_nl);
+        --bodyy
+          UTL_SMTP.WRITE_DATA(v_connection,get_param('EMAIL', 'MIMEVERSION')||con_nl); 
+          UTL_SMTP.WRITE_DATA(v_connection, get_param('EMAIL', 'BOUNDARY1')||v_boundary_text||get_param('EMAIL', 'BOUNDARY2')||con_nl||con_nl);
+          UTL_SMTP.WRITE_DATA(v_connection,get_param('EMAIL', 'BOUNDARYDASH')||v_boundary_text||con_nl);
+          UTL_SMTP.WRITE_DATA(v_connection,get_param('EMAIL', 'CONTENTTYPE')||con_nl); 
+          UTL_SMTP.WRITE_DATA(v_connection,con_nl||get_param('EMAIL', 'TEXT1')||con_nl);
+          UTL_SMTP.WRITE_DATA(v_connection,get_param('EMAIL', 'TEXT2')||con_nl||con_nl);
+          UTL_SMTP.WRITE_DATA(v_connection, get_param('EMAIL', 'TEXT3')||con_nl||get_param('EMAIL', 'TEXT4')||con_nl||con_nl);
+          UTL_SMTP.WRITE_DATA (v_connection, con_nl || con_email_footer||con_nl||con_nl);
+         
+         --DESKBANK SUMMARY ATTACHMENT
+         UTL_SMTP.WRITE_DATA(v_connection,con_nl||get_param('EMAIL', 'BOUNDARYDASH')||v_boundary_text||con_nl);
+         UTL_SMTP.WRITE_DATA(v_connection,get_param('EMAIL', 'CONTENTTYPEATTACHMENT')||v_attachment ||'"'||con_nl); -- stream encoding
+         UTL_SMTP.WRITE_DATA(v_connection,get_param('EMAIL', 'ENCODING')||con_nl||con_nl);    --7bit
+         
+         IF UTL_FILE.IS_OPEN(v_file) THEN 
+         LOOP
+             BEGIN
+                UTL_FILE.GET_LINE(v_file, v_input_line); -- read deskbank summary file, and store in v_input_line
+                UTL_SMTP.write_data (v_connection, v_input_line || con_nl); -- put v_input_line to the attachment
+             EXCEPTION 
+                  WHEN No_Data_Found THEN   
+                  EXIT; 
+            END;    
+        END LOOP;
+    END IF;
+       
+         UTL_SMTP.WRITE_DATA(v_connection,con_nl||get_param('EMAIL', 'BOUNDARYDASH')||v_boundary_text||get_param('EMAIL', 'BOUNDARYDASH')||con_nl); -- footer
+         
+         UTL_SMTP.CLOSE_DATA(v_connection);  
+         UTL_SMTP.quit ( v_connection); 
+         utl_file.fclose(v_file); 
+         announceme(get_param('EMAIL', 'LOGGING')); 
+
+EXCEPTION
+   WHEN OTHERS THEN
+      run_log_failed( get_param('REMARKS', 'EXCEPTION1')||v_module_name||get_param('REMARKS', 'EXCEPTION2')||SQLERRM); 
+      UTL_SMTP.close_data ( v_connection);
+
+END send_email_with_attachment;
+--- Definition of all private procedure and function
+
+---PUBLIC MODULE DEFINITION
+PROCEDURE DailySettlement IS
+--purpose: calculate all of the unsettled transactions, to credit merchants for transactions made by the smartcards.
+    v_module_name       VARCHAR2 (35) :=  get_param('PUBLICMODULENAME', 'DAILYSETTLEMENT');
+    v_program_ID        NUMBER; 
+
+BEGIN
+
+    announceme(v_module_name || get_param('ANNOUNCEME', 'DAILYSETTLEMENT') || TO_CHAR(SYSDATE,get_param('DATEFORMAT', 'DASHES') )); 
+    check_run_table(v_program_id); 
+    
+    
+    IF v_program_ID <> TO_NUMBER(get_param('MODULERAN', 'RAISE')) THEN 
+        upload_new_transactions; 
+        settle_transactions;
+    END IF;
+
+  COMMIT; 
+ 
+EXCEPTION
+   WHEN OTHERS THEN
+      run_log_failed( get_param('REMARKS', 'EXCEPTION1')||v_module_name||get_param('REMARKS', 'EXCEPTION2')||SQLERRM); 
+      
+END;
+
+PROCEDURE DailyBankingSummary( p_report_date DATE DEFAULT sysdate) IS
+--purpose: produce daily summary report used by business units showing banking details generated by Daily Settlement
+-- exec PKG_FSS_SETTLEMENT.DailyBankingSummary(TO_DATE('04/06/2019', 'DD/MM/YYYY')); testing method
+-- author: original
+    v_module_name           VARCHAR2(35) :=  get_param('PUBLICMODULENAME', 'DAILYBANKINGSUMMARY'); 
+    v_filename              VARCHAR2(35) := get_param('FILENAME', 'DAILYBANK')||TO_CHAR(p_report_date, get_param('DATEFORMAT', 'FILENAME')) ||get_param('EXTENSION', 'DAILYBANK'); 
+    v_deskbank_filename     VARCHAR2(35) := get_param('FILENAME', 'DESKBANK') || TO_CHAR(p_report_date, get_param('DATEFORMAT', 'FILENAME')) || get_param('EXTENSION', 'DESKBANK'); 
+    v_input_line            VARCHAR2(200);   
+    v_currency              VARCHAR2(20); -- store formatted currency
+    v_credit                NUMBER :=0; 
+    v_space                 VARCHAR2(1):= get_param('GENERAL', 'SPACE'); 
+    v_dash                  VARCHAR2(1):= get_param('GENERAL', 'DASH1'); 
+    v_file utl_file.file_type;
+    
+    CURSOR c_settlements IS 
+      SELECT BSB,
+            ACCOUNTNR,
+            TRANSACTION_CODE,
+            SETTLEMENT_VALUE,
+            MERCHANTID,
+            MERCHANTTITLE 
+        FROM FSS_DAILY_SETTLEMENT
+        WHERE TO_CHAR(SETTLEDATE, get_param('DATEFORMAT', 'CHECKEQUAL')) =  TO_CHAR(p_report_date, get_param('DATEFORMAT', 'CHECKEQUAL')); 
+BEGIN
+   
+    Announceme(v_module_name||get_param('ANNOUNCEME', 'DAILYBANK')|| TO_CHAR(p_report_date, get_param('DATEFORMAT', 'DASHES'))); 
+    v_file := utl_file.fopen (get_param('DIRECTORY', 'ORCLOZ'),v_filename, get_param('UTLFILE', 'WRITE'));  
+
+    v_input_line := common.f_centre(get_param('DAILYBANKINGSUMMARY', 'FIRSTHEADER')); -- using centre function from common package to centre the header
+    utl_file.put_line(v_file, v_input_line);  
+    
+    v_input_line := common.f_centre(get_param('DAILYBANKINGSUMMARY', 'SECONDHEADER')); 
+    utl_file.put_line(v_file, v_input_line);  
+    
+    v_input_line := get_param('DAILYBANK', 'DATE')||TO_CHAR(p_report_date,get_param('DATEFORMAT', 'DASHES')) ||LPAD(get_param('DAILYBANK', 'PAGE'), 76, ' ');     
+    utl_file.put_line(v_file, v_input_line); 
+    -- header
+    v_input_line := common.f_centre(get_param('DAILYHEADER', 'MERCHANTID'),11)          ||
+                    common.f_centre(get_param('DAILYHEADER', 'MERCHANTNAME'),35)        ||
+                    common.f_centre(get_param('DAILYHEADER', 'ACCOUNT'), 40 )           ||
+                    common.f_centre(get_param('DAILYHEADER', 'DEBIT'), 16 )             ||
+                    common.f_centre(get_param('DAILYHEADER', 'CREDIT'), 30)              ; -- get header for each column
+    utl_file.put_line(v_file, v_input_line);   
+     -- dash under header
+    v_input_line := RPAD(v_dash, 11, v_dash)        || v_space||
+                    RPAD(v_dash, 35, v_dash)        || v_space||
+                    RPAD(v_dash, 15, v_dash)        || v_space||
+                    RPAD(v_dash, 15, v_dash)        || v_space||
+                    RPAD(v_dash, 15, v_dash);   -- generate dash  
+    utl_file.put_line(v_file, v_input_line);
+    
+    FOR r_settlement IN c_settlements LOOP -- body text containing all the data per merchant
+     v_input_line := RPAD(NVL(to_char(r_settlement.merchantid),v_space), 12, v_space)            ||
+                    RPAD(r_settlement.MERCHANTTITLE, 36, v_space)                                ||
+                    RPAD(r_settlement.BSB || r_settlement.ACCOUNTNR, 13, v_space)                ;
+                   
+     v_currency := format_currency(r_settlement.SETTLEMENT_VALUE); -- format the currency
+        
+     
+     IF r_settlement.TRANSACTION_CODE = get_param('DESKBODY', 'TRANSACTION_CREDIT') THEN -- if its a credit transaction
+         v_credit := v_credit + r_settlement.SETTLEMENT_VALUE;
+         v_input_line := v_input_line || LPAD(v_space, 16, v_space) || LPAD(v_currency, 18, v_space);
+       ELSE   
+         v_input_line := v_input_line || LPAD(v_currency, 18, v_space);
+       END IF;
+       
+      utl_file.put_line(v_file, v_input_line);  
+      
+    END LOOP;
+    --putting footer, for credit and debit
+    v_currency := format_currency(v_credit); -- for debit
+    --putting dash first
+     v_input_line :=RPAD(v_space, 63, v_space) ||  RPAD(v_dash, 18, v_dash)  
+     ||v_space|| RPAD(v_dash, 15, v_dash);
+    utl_file.put_line(v_file, v_input_line);
+    --putting the balance line, and debit
+    v_input_line := RPAD('BALANCE TOTAL', 60, v_space)|| LPAD(v_currency, 18, v_space); 
+    --putting credit
+    v_input_line := v_input_line || LPAD(v_currency, 18, v_space);
+    utl_file.put_line(v_file, v_input_line);  
+    utl_file.put_line(v_file, '');
+     utl_file.put_line(v_file, '');
+    --putting deskbankfilename
+    v_input_line := get_param('DAILYBANK', 'DESKBANKFILENAME')|| v_deskbank_filename;
+     utl_file.put_line(v_file, v_input_line); 
+     --putting dispacth date
+    v_input_line := get_param('DAILYBANK', 'DATEWORD')||LPAD(get_param('GENERAL', 'COLON'),8,v_space)|| TO_CHAR(p_report_date, get_param('DATEFORMAT', 'PLAINSPACE'));
+    utl_file.put_line(v_file, v_input_line);
+    -- giving a new line
+     utl_file.put_line(v_file, '');
+     --generating the footer end of report
+     v_input_line := LPAD(v_space, 30, v_space) ||get_param('DAILYBANK', 'FOOTER');
+     utl_file.put_line(v_file, v_input_line);
+     --close utl file
+    utl_file.fclose(v_file); 
+    
+    -- after generating send the deskbank summary with the email procedure
+    send_email_with_attachment(p_report_date);
+    
+  EXCEPTION
+     WHEN NO_DATA_FOUND THEN
+     announceme( get_param('REMARKS', 'EXCEPTION1')||v_module_name||get_param('REMARKS', 'EXCEPTION2')|| get_param('REMARKS', 'NODATAFOUND'));
+     
+      WHEN OTHERS THEN
+      utl_file.fclose(v_file); 
+      announceme( get_param('REMARKS', 'EXCEPTION1')||v_module_name||get_param('REMARKS', 'EXCEPTION2')||SQLERRM); 
+      
+END;
+
+PROCEDURE TerminalUsage IS
+--purpose: generate terminal usage report to finds out which terminal is the busiest and amount of traffic they generate
+--The report when run should produce the Terminal usage data for the current month up to and including the run date.
+--The report data should be ordered so that the most active terminal, in terms of Total Transaction Amount, appears first then all the others in descending order.
+
+    v_module_name           VARCHAR2(35) := get_param('PUBLICMODULENAME', 'TERMINALUSAGE'); 
+    v_filename              VARCHAR2(35) := get_param('FILENAME', 'TERMINALUSAGE')||TO_CHAR(SYSDATE, get_param('DATEFORMAT', 'FILENAME')) ||get_param('EXTENSION', 'TERMINALUSAGE'); 
+    v_input_line            VARCHAR2(300); 
+    v_currency              VARCHAR2(50); -- currency formatted
+    v_space                 VARCHAR2(1):= get_param('GENERAL', 'SPACE'); 
+    v_dash                  VARCHAR2(1):= get_param('GENERAL', 'DASH1');
+    
+    v_file utl_file.file_type;  
+    
+    cursor c_settlements IS 
+    SELECT FDT.TERMINALID terminalid,
+           T.TERMINALTYPE terminaltype,
+          TT.TYPEDESCRIPTION terminaldescription,
+          FDS.MERCHANTTITLE merchanttitle,
+           COUNT(*)numbertransactions,
+           SUM(SETTLEMENT_VALUE)totaltransactionamount
+    FROM FSS_DAILY_SETTLEMENT FDS           JOIN FSS_DAILY_TRANSACTION FDT
+    ON  FDS.LODGEMENTREF = FDT.LODGEMENTREF JOIN FSS_TERMINAL T 
+    ON FDT.TERMINALID = T.TERMINALID        JOIN FSS_TERMINAL_TYPE TT
+    ON TT.TYPENAME = T.TERMINALTYPE
+    WHERE TRANSACTION_CODE = get_param('DESKBODY', 'TRANSACTION_CREDIT') AND
+          TO_CHAR(SETTLEDATE,get_param('DATEFORMAT', 'MONTHYEAR')) =  TO_CHAR(SYSDATE, get_param('DATEFORMAT', 'MONTHYEAR')) -- to put the current month only
+    GROUP BY FDT.TERMINALID, --grouping on terminalid and merchant level
+           T.TERMINALTYPE,
+          TT.TYPEDESCRIPTION,
+          FDS.MERCHANTTITLE
+    ORDER BY SUM(SETTLEMENT_VALUE) DESC; -- order by the total settlement value descending
+
+BEGIN
+    Announceme(v_module_name||get_param('ANNOUNCEME', 'TERMINALUSAGE')|| TO_CHAR(SYSDATE, get_param('DATEFORMAT', 'DASHES'))); 
+    v_file := utl_file.fopen (get_param('DIRECTORY', 'ORCLOZ'),v_filename,get_param('UTLFILE', 'WRITE')); 
+  
+    --header
+    v_input_line := common.f_centre(get_param('TERMINALUSAGE', 'FIRSTHEADER'));  --first header
+    utl_file.put_line(v_file, v_input_line); 
+    
+    v_input_line := common.f_centre(get_param('TERMINALUSAGE', 'SECONDHEADER')); --second header
+    utl_file.put_line(v_file, v_input_line); 
+    
+    --report date
+    v_input_line := get_param('TERMINALUSAGE', 'REPORTDATE')||TO_CHAR(SYSDATE,get_param('DATEFORMAT', 'DASHES')) ||LPAD(get_param('DAILYBANK', 'PAGE'), 76, get_param('GENERAL', 'SPACE'));
+    utl_file.put_line(v_file, v_input_line); 
+    utl_file.put_line(v_file, ''); 
+     -- month usage
+    v_input_line := get_param('TERMINALUSAGE', 'MONTH')||TO_CHAR(SYSDATE,get_param('DATEFORMAT', 'MONTHYEAR'));
+  
+    utl_file.put_line(v_file, v_input_line); 
+    
+    -- header for column level 1
+     v_input_line := common.f_centre(get_param('TERMINALHEADER1', 'TERMINALID'),10)               ||
+                    common.f_centre(get_param('TERMINALHEADER1', 'TERMINALTYPE'),10)              ||
+                    common.f_centre(get_param('TERMINALHEADER1', 'DESCRIPTION'), 24 )             ||
+                    common.f_centre(get_param('TERMINALHEADER1', 'MERCHANTNAME'), 43 )            ||
+                    common.f_centre(get_param('TERMINALHEADER1', 'NUMTRANSACTIONS'), 52 )         ||
+                    common.f_centre(get_param('TERMINALHEADER1', 'TOTALTRANSACTIONS'), 22)        ;
+            --- writing header row 1
+    utl_file.put_line(v_file, v_input_line);   
+    
+    -- header for column level 2
+     v_input_line := common.f_centre('',10)                                                       ||
+                    common.f_centre(get_param('TERMINALHEADER2', 'TERMINALTYPE'),30)              ||
+                    common.f_centre(get_param('TERMINALHEADER2', 'DESCRIPTION'), 27)              ||
+                    common.f_centre(get_param('TERMINALHEADER2', 'MERCHANTNAME'), 45 )            ||
+                    common.f_centre(get_param('TERMINALHEADER2', 'NUMTRANSACTIONS'), 55)          ||
+                    common.f_centre(get_param('TERMINALHEADER2', 'TOTALTRANSACTIONS'), 22)         ;
+        -- writing header row 2
+    utl_file.put_line(v_file, v_input_line); 
+    
+    
+    -- generating dashes
+    v_input_line := RPAD( v_dash , 10,  v_dash )        || v_space ||
+                    RPAD( v_dash , 8,  v_dash )         || v_space ||
+                    RPAD( v_dash , 25,  v_dash )        || v_space ||
+                    RPAD( v_dash , 35,  v_dash )        || v_space ||
+                    RPAD( v_dash , 14,  v_dash )        || v_space || 
+                     RPAD( v_dash , 16,  v_dash )        ;
+    
+    utl_file.put_line(v_file, v_input_line);
+    
+    -- body text
+     FOR r_settlement IN c_settlements LOOP
+    
+     -- format total transaction amount
+        v_currency := format_currency(r_settlement.totaltransactionamount) ;
+     
+     v_input_line :=   RPAD(r_settlement.terminalid, 13,  v_space)               ||   v_space ||
+                       RPAD(r_settlement.terminaltype, 5,  v_space)              ||   v_space ||
+                       RPAD(r_settlement.terminaldescription, 25,  v_space)      ||   v_space ||
+                       RPAD(r_settlement.merchanttitle, 40,  v_space)            ||   v_space ||
+                       RPAD(r_settlement.numbertransactions, 8,  v_space)        ||   v_space ||
+                       RPAD(v_currency, 34,  v_space)                             ; -- generate content
+    
+    
+     utl_file.put_line(v_file, v_input_line); 
+    END LOOP;
+    
+    --footer
+     utl_file.put_line(v_file, '');
+     v_input_line := LPAD( v_space, 30,  v_space) ||get_param('DAILYBANK', 'FOOTER');
+     utl_file.put_line(v_file, v_input_line);
+    
+    utl_file.fclose(v_file);
+  
+  EXCEPTION
+       WHEN NO_DATA_FOUND THEN
+     announceme( get_param('REMARKS', 'EXCEPTION1')||v_module_name||get_param('REMARKS', 'EXCEPTION2')|| get_param('REMARKS', 'NODATAFOUND'));
+     
+       WHEN OTHERS THEN
+      utl_file.fclose(v_file); 
+      announceme( get_param('REMARKS', 'EXCEPTION1')||v_module_name||get_param('REMARKS', 'EXCEPTION2')||SQLERRM); 
+   
+END;
+
+
+END Pkg_FSS_Settlement;
+
+
